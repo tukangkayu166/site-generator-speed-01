@@ -4,13 +4,32 @@
 // ---- Text utilities ----
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESCAPE_RE = /[&<>"']/g;
+const ESCAPE_TEST_RE = /[&<>"']/;
 function escapeHtml(text) {
+  if (!ESCAPE_TEST_RE.test(text)) return text;
   return text.replace(ESCAPE_RE, c => ESCAPES[c]);
 }
 
 const SLUG_MAX = 64;
+const slugifyCache = new Map();
 function slugify(text) {
-  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+  const cached = slugifyCache.get(text);
+  if (cached !== undefined) return cached;
+  
+  // Fast path: if text is already ASCII alphanumeric/hyphen, skip normalize
+  let isAscii = true;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code > 127) { isAscii = false; break; }
+  }
+  
+  let plain;
+  if (isAscii) {
+    plain = text;
+  } else {
+    plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+  }
+  
   let out = '';
   let gap = false;
   for (const ch of plain) {
@@ -26,7 +45,9 @@ function slugify(text) {
     out += keep;
   }
   out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
-  return out === '' ? 'untitled' : out;
+  const result = out === '' ? 'untitled' : out;
+  slugifyCache.set(text, result);
+  return result;
 }
 
 function uniqueSlug(slug, taken) {
@@ -43,8 +64,18 @@ function longDate(date) {
 }
 
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+  let count = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
+      inWord = false;
+    } else if (!inWord) {
+      count++;
+      inWord = true;
+    }
+  }
+  return count;
 }
 
 function resolvePath(dir, rel) {
@@ -251,39 +282,82 @@ function findSingleStar(s, from) {
 }
 
 function inline(s, env) {
-  let out = '';
+  const out = [];
   let i = 0;
+  let last = 0;
   while (i < s.length) {
     const c = s[i];
-    if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) { out += escapeHtml(s[i + 1]); i += 2; continue; }
+    if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) {
+      if (i > last) out.push(escapeHtml(s.slice(last, i)));
+      out.push(escapeHtml(s[i + 1]));
+      i += 2;
+      last = i;
+      continue;
+    }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
-      if (j > i + 1) { out += '<code>' + escapeHtml(s.slice(i + 1, j)) + '</code>'; i = j + 1; }
-      else { out += '`'; i++; }
+      if (j > i + 1) {
+        if (i > last) out.push(escapeHtml(s.slice(last, i)));
+        out.push('<code>');
+        out.push(escapeHtml(s.slice(i + 1, j)));
+        out.push('</code>');
+        i = j + 1;
+        last = i;
+      } else {
+        i++;
+      }
       continue;
     }
     if (c === '*') {
       if (s[i + 1] === '*') {
         const j = findUnescaped(s, '**', i + 2);
-        if (j > i + 2) { out += '<strong>' + inline(s.slice(i + 2, j), env) + '</strong>'; i = j + 2; }
-        else { out += '**'; i += 2; }
+        if (j > i + 2) {
+          if (i > last) out.push(escapeHtml(s.slice(last, i)));
+          out.push('<strong>');
+          out.push(inline(s.slice(i + 2, j), env));
+          out.push('</strong>');
+          i = j + 2;
+          last = i;
+        } else {
+          i += 2;
+        }
         continue;
       }
       const j = findSingleStar(s, i + 1);
-      if (j > i + 1) { out += '<em>' + inline(s.slice(i + 1, j), env) + '</em>'; i = j + 1; }
-      else { out += '*'; i++; }
+      if (j > i + 1) {
+        if (i > last) out.push(escapeHtml(s.slice(last, i)));
+        out.push('<em>');
+        out.push(inline(s.slice(i + 1, j), env));
+        out.push('</em>');
+        i = j + 1;
+        last = i;
+      } else {
+        i++;
+      }
       continue;
     }
     if (c === '[') {
       const k = findUnescaped(s, ']', i + 1);
       const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
       const target = m === -1 ? '' : s.slice(k + 2, m);
-      if (target !== '' && !/\s/.test(target)) { out += '<a href="' + escapeHtml(env.link(target)) + '">' + inline(s.slice(i + 1, k), env) + '</a>'; i = m + 1; continue; }
-      out += '['; i++; continue;
+      if (target !== '' && !/\s/.test(target)) {
+        if (i > last) out.push(escapeHtml(s.slice(last, i)));
+        out.push('<a href="');
+        out.push(escapeHtml(env.link(target)));
+        out.push('">');
+        out.push(inline(s.slice(i + 1, k), env));
+        out.push('</a>');
+        i = m + 1;
+        last = i;
+        continue;
+      }
+      i++;
+      continue;
     }
-    out += escapeHtml(c); i++;
+    i++;
   }
-  return out;
+  if (last < s.length) out.push(escapeHtml(s.slice(last)));
+  return out.join('');
 }
 
 function renderMarkdown(src, env) {
